@@ -7,7 +7,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 SCHEMA = json.loads((Path(__file__).parent.parent / 'schemas/event.schema.json').read_text(encoding='utf-8'))
 VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
-TOPICS = ('shipment_events', 'vehicle_gps', 'external_conditions')
+TOPICS = ('shipment_events', 'vehicle_gps', 'external_conditions', 'operational_updates')
 
 
 def validate(event):
@@ -29,6 +29,7 @@ def simulate(shipments=3, scenario='normal', steps=12):
     """Ronda por segundo; estados y GPS correlacionados por vehículo y ruta."""
     run_id = uuid4().hex[:8]
     stages = ('received', 'departed_center', 'in_transit', 'arrived_center', 'out_for_delivery', 'delivered')
+    started_at = datetime.now(timezone.utc)
     for step in range(steps):
         now = datetime.now(timezone.utc)
         progress = step / max(steps - 1, 1)
@@ -47,4 +48,4 @@ def simulate(shipments=3, scenario='normal', steps=12):
                        shipment_id=f'GUIA-{run_id}-{index:04}', status=status,
                        origin_city='Medellín', destination_city='Bogotá',
                        center_id='CEN-MED' if fraction < .5 else 'CEN-BOG',
-                       promised_delivery=stamp(now + timedelta(minutes=-10 if delayed else 120))), step
+                       promised_delivery=stamp(started_at + timedelta(minutes=-10 if delayed else 120))), step

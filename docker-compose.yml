@@ -1,4 +1,29 @@
 services:
+  spark-topics:
+    profiles: ["streaming"]
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        for topic in shipment_events vehicle_gps external_conditions operational_updates; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic "$$topic" --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        done
+  spark:
+    profiles: ["streaming"]
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - spark_data:/data
+    depends_on:
+      spark-topics:
+        condition: service_completed_successfully
   kafka:
     image: apache/kafka:3.9.1
     ports:
@@ -26,3 +51,4 @@ services:
       retries: 12
 volumes:
   kafka_data:
+  spark_data:

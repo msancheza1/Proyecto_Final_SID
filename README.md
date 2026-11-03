@@ -1,4 +1,10 @@
-# Componente de Mariana
+# Proyecto Final SID
+
+También está implementado el componente de **Sara con Spark Structured Streaming**:
+validación, deduplicación persistente, joins, reglas de riesgo y checkpoints.
+Consulta la [guía de ejecución de Sara](docs/sara.md).
+
+## Componente de Mariana
 
 Base para Proyecto Final SID: simulación de envíos y GPS e ingesta en Apache Kafka.
 Datos completamente ficticios. Alcance: Python, contrato JSON, tópicos, reintentos
