@@ -83,11 +83,11 @@ def kafka_rows(changes, now):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', default=os.getenv('SPARK_DATA_DIR', '/data/sara'))
+    parser.add_argument('--data', default=os.getenv('SPARK_DATA_DIR', '/data/streaming'))
     parser.add_argument('--routes', default='/app/config/routes.jsonl')
     parser.add_argument('--trigger', default='10 seconds')
     args = parser.parse_args()
-    spark = (SparkSession.builder.appName('SID-Sara').config('spark.sql.session.timeZone', 'UTC')
+    spark = (SparkSession.builder.appName('SID-Streaming').config('spark.sql.session.timeZone', 'UTC')
         .config('spark.sql.extensions', 'io.delta.sql.DeltaSparkSessionExtension')
         .config('spark.sql.catalog.spark_catalog', 'org.apache.spark.sql.delta.catalog.DeltaCatalog')
         .config('spark.databricks.delta.snapshotPartitions', '2')
@@ -105,7 +105,7 @@ def main():
         'CAST(NULL AS STRING) key', 'CAST(NULL AS STRING) raw_json', 'CAST(NULL AS STRING) topic',
         'CAST(NULL AS INT) partition', 'CAST(NULL AS LONG) offset',
         'timestamp AS kafka_timestamp', 'true AS clock_tick')
-    query = (kafka.unionByName(clock).writeStream.queryName('sid_sara').option(
+    query = (kafka.unionByName(clock).writeStream.queryName('sid_streaming').option(
         'checkpointLocation', f'{args.data}/checkpoints/main').trigger(processingTime=args.trigger)
         .foreachBatch(lambda batch, batch_id: process(spark, batch, batch_id, args.data, brokers, args.routes)).start())
     query.awaitTermination()

@@ -1,1 +1,1 @@
-"""Procesamiento real con Spark Structured Streaming: componente de Sara."""
+"""Procesamiento de eventos con Spark Structured Streaming."""

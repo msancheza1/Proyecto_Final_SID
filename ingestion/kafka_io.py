@@ -11,7 +11,7 @@ class KafkaSender:
         self.producer = Producer({'bootstrap.servers': bootstrap(),
                                   'enable.idempotence': True, 'acks': 'all',
                                   'delivery.timeout.ms': 10000, 'request.timeout.ms': 5000,
-                                  'retry.backoff.ms': 250, 'client.id': 'mariana-simulator'})
+                                  'retry.backoff.ms': 250, 'client.id': 'shipment-simulator'})
 
     def __call__(self, topic, key, payload):
         result = []

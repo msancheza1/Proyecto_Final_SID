@@ -1,1 +1,1 @@
-"""Ingesta de eventos logísticos, componente de Mariana."""
+"""Ingesta de eventos logísticos."""

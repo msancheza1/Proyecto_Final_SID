@@ -7,7 +7,7 @@ from .outbox import Outbox
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Componente Mariana: simulador y Kafka')
+    parser = argparse.ArgumentParser(description='Simulador e ingesta Kafka')
     parser.add_argument('command', choices=['topics', 'simulate', 'replay', 'consume'])
     parser.add_argument('--shipments', type=int, default=3)
     parser.add_argument('--steps', type=int, default=12, help='0: ejecución continua en ciclos')
