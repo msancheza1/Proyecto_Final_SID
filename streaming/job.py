@@ -1,69 +1,79 @@
-"""Kafka -> validación -> Delta Silver -> joins -> reglas -> Kafka operational_updates."""
+"""Kafka -> Bronze -> Silver -> operational state -> dimensional Gold."""
 import argparse
 import os
-from pathlib import Path
 
 from delta.tables import DeltaTable
 from pyspark.sql import SparkSession, functions as F, Window
 
+from streaming.delta_io import merge_insert, merge_upsert
+from streaming.gold import update_gold
+from streaming.lakehouse import LakehousePaths
 from streaming.transforms import parse, assess
 
 
-def merge_insert(spark, frame, path, condition):
-    if frame.isEmpty():
-        return
-    if DeltaTable.isDeltaTable(spark, path):
-        DeltaTable.forPath(spark, path).alias('t').merge(frame.alias('s'), condition).whenNotMatchedInsertAll().execute()
-    else:
-        frame.write.format('delta').mode('errorifexists').save(path)
-
-
 def process(spark, batch, batch_id, root, brokers, routes_path, publish=True):
+    paths = LakehousePaths(root)
     actual = batch.filter('NOT clock_tick').drop('clock_tick').cache()
     try:
-        # Bronze técnico conserva cada registro Kafka sin modificar, incluso inválidos.
+        # Bronze conserva el registro Kafka original y sus metadatos, incluso si es inválido.
         raw = actual.dropDuplicates(['topic', 'partition', 'offset'])
-        merge_insert(spark, raw, f'{root}/raw', 't.topic=s.topic AND t.partition=s.partition AND t.offset=s.offset')
+        merge_insert(spark, raw, paths.bronze_events,
+                     'target.topic=source.topic AND target.partition=source.partition '
+                     'AND target.offset=source.offset')
         parsed = parse(raw).cache()
         try:
             rejected = parsed.filter("validation_error != ''").select(*raw.columns, 'validation_error')
-            merge_insert(spark, rejected, f'{root}/rejected', 't.topic=s.topic AND t.partition=s.partition AND t.offset=s.offset')
+            merge_insert(spark, rejected, paths.silver_rejected_events,
+                         'target.topic=source.topic AND target.partition=source.partition '
+                         'AND target.offset=source.offset')
             valid = parsed.filter("validation_error = ''").drop('validation_error')
             # Deduplicación global persistida: también cubre reenvíos fuera del watermark.
-            first_seen = Window.partitionBy('event_id').orderBy('kafka_timestamp', 'topic', 'partition', 'offset')
-            unique = valid.withColumn('_first', F.row_number().over(first_seen)).filter('_first = 1').drop('_first')
-            merge_insert(spark, unique, f'{root}/silver_events', 't.event_id=s.event_id')
+            first_seen = Window.partitionBy('event_id').orderBy(
+                'kafka_timestamp', 'topic', 'partition', 'offset')
+            unique = (valid.withColumn('_first', F.row_number().over(first_seen))
+                      .filter('_first = 1').drop('_first'))
+            merge_insert(spark, unique, paths.silver_events,
+                         'target.event_id=source.event_id')
         finally:
             parsed.unpersist()
-        if not DeltaTable.isDeltaTable(spark, f'{root}/silver_events'):
+        if not DeltaTable.isDeltaTable(spark, paths.silver_events):
             return
-        events = spark.read.format('delta').load(f'{root}/silver_events')
-        shipments = events.filter("event_type = 'shipment_event'").drop('latitude', 'longitude', 'speed_kmh')
+        events = spark.read.format('delta').load(paths.silver_events)
+        shipments = events.filter("event_type = 'shipment_event'").drop(
+            'latitude', 'longitude', 'speed_kmh')
         gps = events.filter("event_type = 'vehicle_gps'")
-        routes = spark.read.schema('route_id string, destination_latitude double, destination_longitude double, expected_speed_kmh double').json(routes_path)
-        invalid_routes = routes.filter('route_id IS NULL OR destination_latitude IS NULL OR destination_longitude IS NULL OR expected_speed_kmh IS NULL OR abs(destination_latitude) > 90 OR abs(destination_longitude) > 180 OR expected_speed_kmh <= 0')
-        if not invalid_routes.isEmpty() or routes.groupBy('route_id').count().filter('count > 1').count():
+        route_schema = ('route_id string, destination_latitude double, '
+                        'destination_longitude double, expected_speed_kmh double')
+        routes = spark.read.schema(route_schema).json(routes_path)
+        invalid_routes = routes.filter(
+            'route_id IS NULL OR destination_latitude IS NULL OR '
+            'destination_longitude IS NULL OR expected_speed_kmh IS NULL OR '
+            'abs(destination_latitude) > 90 OR abs(destination_longitude) > 180 OR '
+            'expected_speed_kmh <= 0')
+        duplicated_routes = routes.groupBy('route_id').count().filter('count > 1')
+        if not invalid_routes.isEmpty() or not duplicated_routes.isEmpty():
             raise ValueError('Catálogo de rutas inválido o con identificadores duplicados')
         # Instante estable del microbatch para reintentos y evaluación durante silencio de Kafka.
         now = batch.agg(F.max('kafka_timestamp')).first()[0]
         decisions = assess(shipments, gps, routes, now).cache()
         try:
-            current_path = f'{root}/current_shipments'
+            current_path = paths.silver_current_shipments
             changes = decisions
             if DeltaTable.isDeltaTable(spark, current_path):
-                previous = spark.read.format('delta').load(current_path).select('shipment_id', 'output_event_id')
+                previous = spark.read.format('delta').load(current_path).select(
+                    'shipment_id', 'output_event_id')
                 changes = decisions.join(previous, ['shipment_id', 'output_event_id'], 'left_anti')
             if not changes.isEmpty():
                 # Publicar primero: si cae antes del MERGE, el reintento repite el mismo UUID.
                 if publish:
-                    kafka_rows(changes, now).write.format('kafka').option('kafka.bootstrap.servers', brokers).option(
-                        'topic', 'operational_updates').option('kafka.acks', 'all').save()
-                if DeltaTable.isDeltaTable(spark, current_path):
-                    DeltaTable.forPath(spark, current_path).alias('t').merge(decisions.alias('s'),
-                        't.shipment_id=s.shipment_id').whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-                else:
-                    decisions.write.format('delta').save(current_path)
-            print(f'Batch {batch_id}: evaluación completada', flush=True)
+                    (kafka_rows(changes, now).write.format('kafka')
+                     .option('kafka.bootstrap.servers', brokers)
+                     .option('topic', 'operational_updates')
+                     .option('kafka.acks', 'all').save())
+            merge_upsert(spark, decisions, current_path,
+                         'target.shipment_id=source.shipment_id')
+            update_gold(spark, shipments, decisions, now, paths)
+            print(f'Batch {batch_id}: Silver y Gold actualizados', flush=True)
         finally:
             decisions.unpersist()
     finally:
@@ -94,6 +104,7 @@ def main():
         .config('spark.sql.shuffle.partitions', '4').getOrCreate())
     spark.sparkContext.setLogLevel('WARN')
     brokers = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:29092')
+    paths = LakehousePaths(args.data)
     kafka = (spark.readStream.format('kafka').option('kafka.bootstrap.servers', brokers)
         .option('subscribe', 'shipment_events,vehicle_gps').option('startingOffsets', 'earliest')
         .option('failOnDataLoss', 'true').option('maxOffsetsPerTrigger', 10000).load()
@@ -106,8 +117,9 @@ def main():
         'CAST(NULL AS INT) partition', 'CAST(NULL AS LONG) offset',
         'timestamp AS kafka_timestamp', 'true AS clock_tick')
     query = (kafka.unionByName(clock).writeStream.queryName('sid_streaming').option(
-        'checkpointLocation', f'{args.data}/checkpoints/main').trigger(processingTime=args.trigger)
-        .foreachBatch(lambda batch, batch_id: process(spark, batch, batch_id, args.data, brokers, args.routes)).start())
+        'checkpointLocation', paths.checkpoint).trigger(processingTime=args.trigger)
+        .foreachBatch(lambda batch, batch_id: process(
+            spark, batch, batch_id, args.data, brokers, args.routes)).start())
     query.awaitTermination()
 
 

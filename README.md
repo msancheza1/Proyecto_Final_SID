@@ -58,6 +58,32 @@ Busca `shipment_id`, `status`, `risk_level`, `active_alert` y `possible_delay_re
 
 Spark guarda datos originales, eventos rechazados, eventos válidos y estados actuales en Delta Lake. Sus checkpoints quedan en `/data/streaming/checkpoints/main` dentro del volumen de Docker.
 
+### Arquitectura medallón y modelo Gold
+
+El job usa rutas explícitas por responsabilidad. Bronze conserva el mensaje Kafka sin modificar; Silver contiene registros validados, deduplicados y el estado enriquecido; Gold materializa el esquema estrella solicitado en el informe.
+
+| Capa | Tabla Delta | Propósito |
+| --- | --- | --- |
+| Bronze | `bronze/events` | Payload original, topic, partición, offset y hora de ingreso para auditoría y reproceso. |
+| Silver | `silver/events` | Eventos normalizados y deduplicados globalmente por `event_id`. |
+| Silver | `silver/rejected_events` | Cuarentena con el error de validación y la referencia Kafka original. |
+| Silver | `silver/current_shipments` | Último estado y evaluación operacional por guía. |
+| Gold | `gold/fact_desempeno_envio` | Un registro por guía con tiempos real y prometido, retraso, permanencia conocida, movimientos, cumplimiento, riesgo y linaje. |
+| Gold | `gold/dim_*` | Fecha, ruta, ciudad, centro logístico, vehículo y estado del envío. |
+| Gold | `gold/indicadores_cumplimiento_diario` | Indicadores por fecha prometida y ruta para dashboards. |
+
+Las claves dimensionales son determinísticas y los hechos se actualizan con `MERGE`, por lo que reintentar un microbatch no crea duplicados lógicos. El agregado de indicadores se reemplaza en una transacción Delta después de actualizar los hechos, evitando grupos obsoletos.
+
+Para ejecutar las consultas auditables de cumplimiento (resumen general, cumplimiento por ruta, retrasos por destino, backlog de alto riesgo, permanencia en centros e indicadores diarios):
+
+```powershell
+docker compose --profile streaming run --rm --no-deps spark streaming/gold_queries.py --data /data/streaming --query all
+```
+
+También puedes elegir una consulta, por ejemplo `--query compliance_by_route`. Las sentencias revisables están en `queries/gold_compliance.sql`.
+
+> Si el volumen fue creado por una versión anterior que guardaba tablas directamente bajo `/data/streaming`, usa un volumen nuevo para la validación de esta entrega o migra esas tablas antes de reutilizar el checkpoint. No borres un volumen con datos que necesites conservar.
+
 ## 5. Probar recuperación
 
 **Reenvío de ingesta:** inicia el simulador con `--steps 0`. En otra terminal ejecuta `docker compose stop kafka`. Espera a que el simulador agote sus reintentos y se detenga. Consulta qué evento quedó pendiente:
@@ -83,7 +109,7 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-s
 docker compose --profile streaming run --rm --no-deps --build spark tests/spark_integration.py
 ```
 
-Las primeras pruebas se ejecutan sin Kafka ni Spark. La segunda usa Spark y Delta dentro de Docker con datos de prueba aislados; no publica en Kafka.
+Las primeras pruebas se ejecutan sin Kafka ni Spark. La segunda usa Spark y Delta dentro de Docker con datos de prueba aislados; no publica en Kafka. Contrasta una entrega a tiempo, una entrega tardía y un envío abierto cuya promesa vence durante un tick técnico. Además, verifica la idempotencia del `MERGE`, las seis dimensiones, la tabla de hechos y los indicadores esperados (50 % de cumplimiento entre entregas finalizadas, sin contar envíos todavía abiertos en el denominador).
 
 Para apagar los servicios conservando los datos y checkpoints:
 
